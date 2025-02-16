@@ -32,11 +32,11 @@ from e2e import cluster
 # often 25+ minutes even for small clusters. We wait this amount of time before
 # even trying to fetch a cluster's state.
 CREATE_WAIT_AFTER_SECONDS = 180
-DELETE_WAIT_SECONDS = 30
-MODIFY_WAIT_AFTER_SECONDS = 10
+DELETE_WAIT_SECONDS = 180
+MODIFY_WAIT_AFTER_SECONDS = 180
 
 # Time to wait after the cluster has changed status, for the CR to update
-CHECK_STATUS_WAIT_SECONDS = 60
+CHECK_STATUS_WAIT_SECONDS = 180
 
 
 @pytest.fixture(scope="module")
@@ -86,6 +86,49 @@ def simple_cluster():
     # NOTE(jaypipes): We wait until the cluster can no longer be found in MSK,
     # otherwise, trying to delete subnets referenced in the cluster
     # configuration will result in a failure...
+    cluster.wait_until_deleted(cluster_name)
+
+
+@pytest.fixture(scope="module")
+def update_test_cluster():
+    cluster_name = random_suffix_name("update-test-cluster", 24)
+
+    resources = get_bootstrap_resources()
+    vpc = resources.ClusterVPC
+    subnet_id_1 = vpc.public_subnets.subnet_ids[0]
+    subnet_id_2 = vpc.public_subnets.subnet_ids[1]
+
+    replacements = REPLACEMENT_VALUES.copy()
+    replacements["CLUSTER_NAME"] = cluster_name
+    replacements["SUBNET_ID_1"] = subnet_id_1
+    replacements["SUBNET_ID_2"] = subnet_id_2
+
+    resource_data = load_resource(
+        "cluster_updates",
+        additional_replacements=replacements,
+    )
+
+    ref = k8s.CustomResourceReference(
+        CRD_GROUP,
+        CRD_VERSION,
+        CLUSTER_RESOURCE_PLURAL,
+        cluster_name,
+        namespace="default",
+    )
+    k8s.create_custom_resource(ref, resource_data)
+    cr = k8s.wait_resource_consumed_by_controller(ref)
+
+    assert cr is not None
+    assert k8s.get_resource_exists(ref)
+
+    yield (ref, cr)
+
+    _, deleted = k8s.delete_custom_resource(
+        ref,
+        period_length=DELETE_WAIT_SECONDS,
+    )
+    assert deleted
+
     cluster.wait_until_deleted(cluster_name)
 
 
@@ -147,6 +190,85 @@ class TestCluster:
 
         latest_secrets = cluster.get_associated_scram_secrets(cluster_arn)
         assert len(latest_secrets) == 0
+
+    @pytest.mark.slow  # These updates take a long time
+    def test_update_broker_properties(self, update_test_cluster):
+        ref, res = update_test_cluster
+
+        time.sleep(CREATE_WAIT_AFTER_SECONDS)
+
+        cr = k8s.get_resource(ref)
+        assert "status" in cr
+        assert "ackResourceMetadata" in cr["status"]
+        assert "arn" in cr["status"]["ackResourceMetadata"]
+        cluster_arn = cr["status"]["ackResourceMetadata"]["arn"]
+
+        # Wait for cluster to be active before updates
+        cluster.wait_until(
+            cluster_arn,
+            cluster.state_matches("ACTIVE"),
+        )
+        time.sleep(CHECK_STATUS_WAIT_SECONDS)
+        condition.assert_synced(ref)
+
+        # Test updating broker storage
+        updates = {
+            "spec": {
+                "brokerNodeGroupInfo": {
+                    "storageInfo": {
+                        "ebsStorageInfo": {
+                            "volumeSize": 100
+                        }
+                    }
+                }
+            }
+        }
+        k8s.patch_custom_resource(ref, updates)
+        time.sleep(MODIFY_WAIT_AFTER_SECONDS)
+        cluster.wait_until(
+            cluster_arn,
+            cluster.state_matches("ACTIVE"),
+        )
+        time.sleep(CHECK_STATUS_WAIT_SECONDS)
+        condition.assert_synced(ref)
+
+        # Test updating instance type
+        updates = {
+            "spec": {
+                "brokerNodeGroupInfo": {
+                    "instanceType": "kafka.t3.medium"
+                }
+            }
+        }
+        k8s.patch_custom_resource(ref, updates)
+        time.sleep(MODIFY_WAIT_AFTER_SECONDS)
+        cluster.wait_until(
+            cluster_arn,
+            cluster.state_matches("ACTIVE"),
+        )
+        time.sleep(CHECK_STATUS_WAIT_SECONDS)
+        condition.assert_synced(ref)
+
+        # Test updating broker count
+        updates = {
+            "spec": {
+                "numberOfBrokerNodes": 4
+            }
+        }
+        k8s.patch_custom_resource(ref, updates)
+        time.sleep(MODIFY_WAIT_AFTER_SECONDS)
+        cluster.wait_until(
+            cluster_arn,
+            cluster.state_matches("ACTIVE"),
+        )
+        time.sleep(CHECK_STATUS_WAIT_SECONDS)
+        condition.assert_synced(ref)
+
+        # Verify final state
+        cr = k8s.get_resource(ref)
+        assert cr["spec"]["brokerNodeGroupInfo"]["storageInfo"]["ebsStorageInfo"]["volumeSize"] == 100
+        assert cr["spec"]["brokerNodeGroupInfo"]["instanceType"] == "kafka.t3.medium"
+        assert cr["spec"]["numberOfBrokerNodes"] == 4
 
 
 #

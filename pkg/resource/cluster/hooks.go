@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	svcapitypes "github.com/aws-controllers-k8s/kafka-controller/apis/v1alpha1"
@@ -149,16 +150,127 @@ func (rm *resourceManager) customUpdate(
 		return updatedRes, requeueWaitUntilCanModify(latest)
 	}
 
-	if delta.DifferentAt("Spec.AssociatedSCRAMSecrets") {
-		err = rm.syncAssociatedScramSecrets(ctx, updatedRes, latest)
-		if err != nil {
-			return nil, err
-		}
+	// Handle each update through separate functions since they are
+	// separate APIs
+	if err = rm.updateBrokerStorage(ctx, desired, latest, delta, updatedRes); err != nil {
+		return nil, err
 	}
 
-	// Set synced condition to True after successful update
+	if err = rm.updateBrokerType(ctx, desired, latest, delta, updatedRes); err != nil {
+		return nil, err
+	}
+
+	if err = rm.updateBrokerCount(ctx, desired, latest, delta, updatedRes); err != nil {
+		return nil, err
+	}
+
+	if err = rm.syncAssociatedScramSecrets(ctx, updatedRes, latest); err != nil {
+		return nil, err
+	}
+
 	ackcondition.SetSynced(updatedRes, corev1.ConditionTrue, nil, nil)
 	return updatedRes, nil
+}
+
+func (rm *resourceManager) updateBrokerStorage(
+	ctx context.Context,
+	desired *resource,
+	latest *resource,
+	delta *ackcompare.Delta,
+	updatedRes *resource,
+) (err error) {
+	rlog := ackrtlog.FromContext(ctx)
+	exit := rlog.Trace("rm.updateBrokerStorage")
+	defer func() { exit(err) }()
+
+	if !delta.DifferentAt("Spec.BrokerNodeGroupInfo.StorageInfo.EBSStorageInfo.VolumeSize") {
+		return nil
+	}
+	if desired.ko.Spec.BrokerNodeGroupInfo == nil ||
+		desired.ko.Spec.BrokerNodeGroupInfo.StorageInfo == nil ||
+		desired.ko.Spec.BrokerNodeGroupInfo.StorageInfo.EBSStorageInfo == nil ||
+		desired.ko.Spec.BrokerNodeGroupInfo.StorageInfo.EBSStorageInfo.VolumeSize == nil ||
+		latest.ko.Spec.ConfigurationInfo == nil ||
+		latest.ko.Spec.ConfigurationInfo.Revision == nil {
+		msg := "required fields for UpdateBrokerStorage are nil"
+		rlog.Debug(msg)
+		return errors.New(msg)
+	}
+	input := &svcsdk.UpdateBrokerStorageInput{
+		ClusterArn:     (*string)(updatedRes.ko.Status.ACKResourceMetadata.ARN),
+		CurrentVersion: aws.String(strconv.FormatInt(*latest.ko.Spec.ConfigurationInfo.Revision, 10)),
+		TargetBrokerEBSVolumeInfo: []svcsdktypes.BrokerEBSVolumeInfo{
+			{
+				VolumeSizeGB: aws.Int32(int32(*desired.ko.Spec.BrokerNodeGroupInfo.StorageInfo.EBSStorageInfo.VolumeSize)),
+			},
+		},
+	}
+	_, err = rm.sdkapi.UpdateBrokerStorage(ctx, input)
+	rm.metrics.RecordAPICall("UPDATE", "UpdateBrokerStorage", err)
+	return err
+}
+
+func (rm *resourceManager) updateBrokerType(
+	ctx context.Context,
+	desired *resource,
+	latest *resource,
+	delta *ackcompare.Delta,
+	updatedRes *resource,
+) (err error) {
+	rlog := ackrtlog.FromContext(ctx)
+	exit := rlog.Trace("rm.updateBrokerType")
+	defer func() { exit(err) }()
+
+	if !delta.DifferentAt("Spec.BrokerNodeGroupInfo.InstanceType") {
+		return nil
+	}
+	if desired.ko.Spec.BrokerNodeGroupInfo == nil ||
+		desired.ko.Spec.BrokerNodeGroupInfo.InstanceType == nil ||
+		latest.ko.Spec.ConfigurationInfo == nil ||
+		latest.ko.Spec.ConfigurationInfo.Revision == nil {
+		msg := "required fields for UpdateBrokerType are nil"
+		rlog.Debug(msg)
+		return errors.New(msg)
+	}
+	input := &svcsdk.UpdateBrokerTypeInput{
+		ClusterArn:         (*string)(updatedRes.ko.Status.ACKResourceMetadata.ARN),
+		CurrentVersion:     aws.String(strconv.FormatInt(*latest.ko.Spec.ConfigurationInfo.Revision, 10)),
+		TargetInstanceType: desired.ko.Spec.BrokerNodeGroupInfo.InstanceType,
+	}
+	_, err = rm.sdkapi.UpdateBrokerType(ctx, input)
+	rm.metrics.RecordAPICall("UPDATE", "UpdateBrokerType", err)
+	return err
+}
+
+func (rm *resourceManager) updateBrokerCount(
+	ctx context.Context,
+	desired *resource,
+	latest *resource,
+	delta *ackcompare.Delta,
+	updatedRes *resource,
+) (err error) {
+	rlog := ackrtlog.FromContext(ctx)
+	exit := rlog.Trace("rm.updateBrokerCount")
+	defer func() { exit(err) }()
+
+	if !delta.DifferentAt("Spec.NumberOfBrokerNodes") {
+		return nil
+	}
+	if desired.ko.Spec.NumberOfBrokerNodes == nil ||
+		latest.ko.Spec.ConfigurationInfo == nil ||
+		latest.ko.Spec.ConfigurationInfo.Revision == nil {
+		msg := "required fields for UpdateBrokerCount are nil"
+		rlog.Debug(msg)
+		return errors.New(msg)
+	}
+	input := &svcsdk.UpdateBrokerCountInput{
+		ClusterArn:                (*string)(updatedRes.ko.Status.ACKResourceMetadata.ARN),
+		CurrentVersion:            aws.String(strconv.FormatInt(*latest.ko.Spec.ConfigurationInfo.Revision, 10)),
+		TargetNumberOfBrokerNodes: aws.Int32(int32(*desired.ko.Spec.NumberOfBrokerNodes)),
+	}
+	_, err = rm.sdkapi.UpdateBrokerCount(ctx, input)
+	rm.metrics.RecordAPICall("UPDATE", "UpdateBrokerCount", err)
+	return err
 }
 
 // syncAssociatedScramSecrets examines the Secret ARNs in the supplied Cluster
